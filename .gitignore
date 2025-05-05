@@ -1,0 +1,5 @@
+/target
+/.restic_repo_password
+/Cargo.lock
+/config.yaml
+/output
