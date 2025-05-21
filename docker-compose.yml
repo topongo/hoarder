@@ -7,10 +7,15 @@ services:
       AWS_ACCESS_KEY_ID: ${RESTIC_S3_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       RESTIC_PASSWORD_FILE: /run/secrets/restic_repo_password
+      RUST_LOG: hoarder=debug
+      HOARDER_RESTIC_IMAGE: hoarder
+      HOARDER_BASE_PATH: /input
+
     # secrets:
     #   - restic_repo_password
     volumes:
       - /run/docker.sock:/run/docker.sock
+      - ${HOARDER_INTERMEDIATE:?}:/input
 
 # secrets:
   # restic_repo_password:
