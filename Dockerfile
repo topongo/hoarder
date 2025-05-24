@@ -12,12 +12,7 @@ COPY src src
 RUN touch src/main.rs
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
-FROM alpine AS runner
-
-RUN apk add --no-cache \
-      docker \
-      docker-compose \
-      restic
+FROM topongo/alpine-docker-restic AS runner
 
 COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/hoarder /usr/bin/hoarder
 
