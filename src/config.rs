@@ -29,6 +29,8 @@ pub(crate) struct Config {
     restic_password_file: Option<String>,
     /// restic host to use
     restic_host: Option<String>,
+    /// the restic container name/id to use
+    restic_container_name: Option<String>,
     /// whether to run in dry run mode
     #[serde(default)]
     dry_run: bool,
@@ -70,6 +72,12 @@ impl Config {
         self._get_env("RESTIC_HOST")
             .or_else(|| self.restic_host.clone())
             .expect("restic_host must be set")
+    }
+
+    pub fn restic_container_name(&self) -> String {
+        self._get_env("RESTIC_CONTAINER_NAME")
+            .or_else(|| self.restic_container_name.clone())
+            .unwrap_or(RESTIC_CONTAINER_NAME.to_string())
     }
 
     pub fn intermediate_path(&self) -> String {

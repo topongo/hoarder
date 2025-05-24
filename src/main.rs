@@ -47,7 +47,7 @@ impl<R: Read> SpinnerWriter<R> {
     }
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     pretty_env_logger::init();
 
     let config = std::fs::read_to_string("config.yaml").expect("Failed to read config file");
@@ -100,7 +100,7 @@ fn main() {
                         );
                         let mut command = dcommand.into_command();
                         let output_path = PathBuf::from(config.intermediate_path()).join(&service_name);
-                        std::fs::create_dir_all(&output_path).unwrap();
+                        std::fs::create_dir_all(&output_path)?;
                         let output_name = format!("{}.{}", archive_name, ext);
                         let output_file = output_path.join(output_name);
                         debug!("{}: {}: ExecStdout: output file: {:?}", service_name, archive_name, output_file);
@@ -120,7 +120,7 @@ fn main() {
                                 bar: indicatif::ProgressBar::new_spinner(),
                             }
                         } else {
-                            let output = File::create(&output_file).unwrap();
+                            let output = File::create(&output_file)?;
                             SpinnerWriter {
                                 output: BufWriter::new(Box::new(output)),
                                 input: BufReader::new(stdout),
@@ -215,7 +215,13 @@ fn main() {
                                             .stdout(Stdio::piped());
                                         debug!("{}: {}: ComposeBoundVolume: inspecting container: docker {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
                                         let inspect_raw = command.output().expect("Failed to inspect container");
-                                        let inspect = serde_json::from_slice::<Vec<DockerContainerInspectOutput>>(&inspect_raw.stdout).expect("Failed to parse container inspect output").into_iter().next().unwrap();
+                                        let inspect = match serde_json::from_slice::<Vec<DockerContainerInspectOutput>>(&inspect_raw.stdout)?.into_iter().next() {
+                                            Some(i) => i,
+                                            None => {
+                                                error!("{}: {}: ComposeBoundVolume: no mounts found in container inspect output", service_name, archive_name);
+                                                continue;
+                                            }
+                                        };
                                         match inspect.mounts.into_iter().find(|m| m.destination == path.to_string_lossy()) {
                                             Some(mount) => {
                                                 let host_path = mount.source;
@@ -271,37 +277,45 @@ fn main() {
             env.push((key, value));
         }
     }
-    let mut options = vec!["--rm".to_owned(), "--name".to_owned(), "hoarder-backup".to_owned(), "-d".to_owned()];
+    let mut options = vec!["--rm".to_owned(), "--name".to_owned(), config.restic_container_name(), "-d".to_owned()];
     // append env vars
     for (k, v) in &env {
         options.push("--env".to_owned());
         options.push(format!("{}={}", k, v));
     }
-    let mut command = config.docker_command_with_context(
+
+    // stop any existing container
+    if config.docker_command_with_context(DockerSubcommand::stop(
+            config.restic_container_name(),
+            Vec::<String>::new(),
+        ))
+        .spawn_and_wait()?
+        .success()
+    {
+        warn!("another container with the name {} has been found and stopped", config.restic_container_name());
+        warn!("waiting 1 second for letting the daemon delete it...");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    if !config.docker_command_with_context(
         DockerSubcommand::run(
             config.restic_image(),
             mounts,
             options,
-            vec!["sleep", "infinity"],
-        )
-    ).into_command();
-
-    if !command
-        .spawn()
-        .expect("failed to start restic container")
-        .wait()
-        .expect("failed to wait for restic container")
+            vec!["tini", "--", "sleep", "infinity"],
+        ))
+        .spawn_and_wait()?
         .success()
     {
         error!("failed to start restic container");
-        return;
+        return Ok(());
     }
 
     for backup in backups {
         let task = backup.into_task();
 
         let mut command = config.docker_command_with_context(DockerSubcommand::exec(
-            "hoarder-backup",
+            config.restic_container_name(),
             task,
             vec!["-it"],
         )).into_command();

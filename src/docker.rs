@@ -258,6 +258,22 @@ impl DockerCommand {
 
         command
     }
+
+    pub(crate) fn spawn(self) -> std::io::Result<std::process::Child> {
+        self.into_command().spawn()
+    }
+
+    pub(crate) fn spawn_and_wait(self) -> std::io::Result<std::process::ExitStatus> {
+        self.into_command().spawn()?.wait()
+    }
+
+    pub(crate) fn spawn_and_expect(self) {
+        match self.spawn_and_wait() {
+            Ok(status) if status.success() => {},
+            Ok(status) => panic!("Docker command failed with status: {}", status),
+            Err(e) => panic!("Failed to spawn Docker command: {}", e),
+        }
+    }
 }
 
 #[derive(Debug)]
