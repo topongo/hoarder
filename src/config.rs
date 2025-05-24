@@ -4,10 +4,12 @@ use crate::{service::Service, DockerCommand, DockerSubcommand};
 
 static RESTIC_ROOT: &str = "/restic";
 static RESTIC_IMAGE: &str = "test";
+static RESTIC_CONTAINER_NAME: &str = "hoarder-restic";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct FullConfig {
     pub(crate) services: Vec<Service>,
+    pub(crate) hooks: HookConfig,
     #[serde(flatten)]
     pub(crate) config: Config,
 }

@@ -1,5 +1,6 @@
 use archive::{ArchiveInput, ArchiveOptions};
-use config::FullConfig;
+use config::{Config, FullConfig};
+use error::SerializableError;
 use indicatif::HumanBytes;
 use log::{debug, error, info, warn};
 use restic::ResticBackup;
@@ -14,6 +15,8 @@ mod task;
 mod docker;
 mod either;
 mod restic;
+mod error;
+mod hooks;
 
 use task::ShellTask;
 use docker::{DockerBinding, DockerCommand, DockerComposeSubcommand, DockerContainerSubcommand, DockerInputType, DockerSubcommand, DockerVolumeSubcommand};
@@ -46,11 +49,41 @@ impl<R: Read> SpinnerWriter<R> {
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn main() {
     pretty_env_logger::init();
 
-    let config = std::fs::read_to_string("config.yaml").expect("Failed to read config file");
-    let FullConfig { services, config } = serde_yaml::from_str(&config).expect("Failed to parse config file");
+    let config = match std::fs::read_to_string("config.yaml") {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to read config file: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let FullConfig { services, config, hooks } = serde_yaml::from_str(&config).expect("Failed to parse config file");
+
+    match inner(services, config) {
+        Err(e) => {
+            error!("an error occurred: {}", e);
+            // execute fail hook
+            info!("running fail hook");
+            hooks.failure(e);
+            std::process::exit(1);
+        }
+        Ok(failed) => {
+            info!("backup completed successfully");
+            // execute success hook
+            if failed.is_empty() {
+                info!("running success hook");
+                hooks.success();
+            } else {
+                info!("running partial hook with {} failed backups", failed.len());
+                hooks.partial(failed);
+            }
+        }
+    }
+}
+
+fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, SerializableError> {
 
     info!("Backup summary:");
     for service in &services {
@@ -72,6 +105,8 @@ fn main() -> std::io::Result<()> {
             PathBuf::from("/restic_password"),
         )
     ];
+
+    let mut failed: Vec<String> = vec![];
 
     for service in services {
         debug!("{}: service: {:?}", service.name, service);
@@ -140,6 +175,7 @@ fn main() -> std::io::Result<()> {
                                     for line in buf.lines() {
                                         error!("=> {}", line);
                                     }
+                                    failed.push(format!("{}:{}: {}", service_name, archive_name, buf));
                                     continue;
                                 }
                             }
@@ -218,6 +254,7 @@ fn main() -> std::io::Result<()> {
                                             Some(i) => i,
                                             None => {
                                                 error!("{}: {}: ComposeBoundVolume: no mounts found in container inspect output", service_name, archive_name);
+                                                failed.push(format!("{}:{}: no mounts found in container inspect output", service_name, archive_name));
                                                 continue;
                                             }
                                         };
