@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::service::Service;
+use crate::{service::Service, DockerCommand, DockerSubcommand};
 
-static BASE_PATH: &str = "./output";
-static RESTIC_BASE_PATH: &str = "/backup";
+static RESTIC_ROOT: &str = "/restic";
 static RESTIC_IMAGE: &str = "test";
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -16,14 +15,25 @@ pub(crate) struct FullConfig {
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct Config {
     /// where temporary data will be stored/mounted inside the restic container
-    base_path: Option<String>,
+    restic_root: Option<String>,
     /// the restic image to use
     restic_image: Option<String>,
     /// the restic path to back up once inside the container
-    resitc_base_path: Option<String>,
+    intermediate_path: Option<String>,
+    /// directory to mount in restic container.
+    /// used if using a docker in docker setup: if the intermediate_path is /data in the host and
+    /// /int in the first container, this should be set to /data, as the second container will
+    /// always mount from the host and not the first container
+    intermediate_mount_override: Option<String>,
+    /// the restic password file to use
+    restic_password_file: Option<String>,
+    /// restic host to use
+    restic_host: Option<String>,
     /// whether to run in dry run mode
     #[serde(default)]
-    pub(crate) dry_run: bool,
+    dry_run: bool,
+    #[serde(default)]
+    pub(crate) docker_context: Option<String>,
 }
 
 impl Config {
@@ -39,10 +49,10 @@ impl Config {
         }
     }
 
-    pub fn base_path(&self) -> String {
-        self._get_env("BASE_PATH")
-            .or_else(|| self.base_path.clone())
-            .unwrap_or(BASE_PATH.to_string())
+    pub fn restic_root(&self) -> String {
+        self._get_env("RESTIC_ROOT")
+            .or_else(|| self.restic_root.clone())
+            .unwrap_or(RESTIC_ROOT.to_string())
     }
 
     pub fn restic_image(&self) -> String {
@@ -51,9 +61,40 @@ impl Config {
             .unwrap_or(RESTIC_IMAGE.to_string())
     }
 
-    pub fn restic_base_path(&self) -> String {
-        self._get_env("RESTIC_BASE_PATH")
-            .or_else(|| self.resitc_base_path.clone())
-            .unwrap_or(RESTIC_BASE_PATH.to_string())
+    pub fn restic_password_file(&self) -> String {
+        self._get_env("RESTIC_PASSWORD_FILE")
+            .expect("restic_password_file must be set")
+    }
+
+    pub fn restic_host(&self) -> String {
+        self._get_env("RESTIC_HOST")
+            .or_else(|| self.restic_host.clone())
+            .expect("restic_host must be set")
+    }
+
+    pub fn intermediate_path(&self) -> String {
+        self._get_env("INTERMEDIATE")
+            .or_else(|| self.intermediate_path.clone())
+            .expect("intermediate_path must be set")
+    }
+
+    pub fn intermediate_mount_override(&self) -> Option<String> {
+        self._get_env("INTERMEDIATE_MOUNT_OVERRIDE")
+            .or_else(|| self.intermediate_mount_override.clone())
+    }
+
+    pub fn docker_command_with_context(&self, subcommand: DockerSubcommand) -> DockerCommand {
+        DockerCommand::new(
+            subcommand,
+            self.docker_context.clone(),
+        )
+    }
+
+    pub fn dry_run(&self) -> bool {
+        self._get_env("DRY_RUN")
+            .or_else(|| Some(self.dry_run.to_string()))
+            .unwrap_or("false".to_string())
+            .parse()
+            .unwrap()
     }
 }

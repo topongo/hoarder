@@ -1,21 +1,25 @@
 services:
   hoarder:
     build: .
-    image: hoarder
+    image: topongo/hoarder
     environment:
       RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:?}
-      AWS_ACCESS_KEY_ID: ${RESTIC_S3_ACCESS_KEY_ID:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       RESTIC_PASSWORD_FILE: /run/secrets/restic_repo_password
+      HOARDER_RESTIC_HOST: ${HOARDER_RESTIC_HOST:?}
       RUST_LOG: hoarder=debug
-      HOARDER_RESTIC_IMAGE: hoarder
-      HOARDER_BASE_PATH: /input
+      HOARDER_RESTIC_IMAGE: topongo/hoarder
+      # HOARDER_RESTIC_ROOT: /backup
+      HOARDER_INTERMEDIATE: /intermediate
+      HOARDER_INTERMEDIATE_MOUNT_OVERRIDE: ${HOARDER_INTERMEDIATE:-}
+      HOARDER_RESTIC_PASSWORD_FILE: ${HOARDER_RESTIC_PASSWORD_FILE:?}
 
     # secrets:
     #   - restic_repo_password
     volumes:
       - /run/docker.sock:/run/docker.sock
-      - ${HOARDER_INTERMEDIATE:?}:/input
+      - ${HOARDER_INTERMEDIATE:?}:/intermediate
 
 # secrets:
   # restic_repo_password:

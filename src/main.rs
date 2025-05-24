@@ -2,8 +2,9 @@ use archive::{ArchiveInput, ArchiveOptions};
 use config::FullConfig;
 use indicatif::HumanBytes;
 use log::{debug, error, info, warn};
+use restic::ResticBackup;
 use service::Service;
-use std::{fs::File, io::{BufReader, BufWriter, Read, Write}, path::PathBuf, process::Stdio};
+use std::{fs::File, io::{BufReader, BufWriter, Read, Write}, path::PathBuf, process::{ExitStatus, Stdio}};
 use serde::Deserialize;
 
 mod config;
@@ -11,9 +12,14 @@ mod service;
 mod archive;
 mod task;
 mod docker;
+mod either;
+mod mount;
+mod restic;
 
 use task::ShellTask;
-use docker::DockerInputType;
+use docker::{DockerBinding, DockerCommand, DockerComposeSubcommand, DockerContainerSubcommand, DockerInputType, DockerSubcommand, DockerVolumeSubcommand, PathExclude};
+#[allow(unused_imports)]
+use either::Either::{Left, Right};
 
 struct SpinnerWriter<R: Read> {
     output: BufWriter<Box<dyn Write>>,
@@ -47,8 +53,6 @@ fn main() {
     let config = std::fs::read_to_string("config.yaml").expect("Failed to read config file");
     let FullConfig { services, config } = serde_yaml::from_str(&config).expect("Failed to parse config file");
 
-    let mut mountlist = Vec::new();
-
     info!("Backup summary:");
     for service in &services {
         info!("- {}:", service.name);
@@ -58,10 +62,23 @@ fn main() {
     }
     info!("");
 
+    let mut backups: Vec<ResticBackup> = vec![];
+    let mut mounts: Vec<DockerBinding> = vec![
+        DockerBinding::new_ro(
+            config.restic_root(),
+            PathBuf::from(config.intermediate_mount_override().unwrap_or(config.intermediate_path())),
+        ),
+        DockerBinding::new_ro(
+            config.restic_password_file(),
+            PathBuf::from("/restic_password"),
+        )
+    ];
+
     for service in services {
         debug!("{}: service: {:?}", service.name, service);
         let Service { archives, compose_project, name: service_name } = service;
         let compose_project = compose_project.unwrap_or(service_name.clone());
+        let mut excludes = vec![];
         for archive in archives {
             debug!("{}: {}: archive: {:?}", service_name, compose_project, archive);
             let ArchiveOptions { input, name: archive_name } = archive;
@@ -69,24 +86,33 @@ fn main() {
                 ArchiveInput::Docker(docker_input) => match docker_input {
                     DockerInputType::ExecStdout { service, task, ext } => {
                         info!("{}: {}: using mode: ExecStdout", service_name, archive_name);
-                        let mut command = std::process::Command::new("docker");
-                        command.args(["compose", "-p", &compose_project, "exec", "-i", &service]);
-                        command.args(task.args());
-                        let output_path = PathBuf::from(config.base_path()).join(&service_name);
+
+                        let dcommand = config.docker_command_with_context(
+                            DockerSubcommand::Compose {
+                                project: Left(compose_project.clone()),
+                                subcommand: DockerComposeSubcommand::Exec {
+                                    service: service.clone(),
+                                    task: task.clone(),
+                                },
+                                options: vec![],
+                                options_inner: vec!["-i".to_owned()],
+                            },
+                        );
+                        let mut command = dcommand.into_command();
+                        let output_path = PathBuf::from(config.intermediate_path()).join(&service_name);
                         std::fs::create_dir_all(&output_path).unwrap();
                         let output_name = format!("{}.{}", archive_name, ext);
                         let output_file = output_path.join(output_name);
                         debug!("{}: {}: ExecStdout: output file: {:?}", service_name, archive_name, output_file);
 
-                        let output = File::create(&output_file).unwrap();
                         command
                             .stderr(std::process::Stdio::piped())
                             .stdout(Stdio::piped());
                         debug!("{}: {}: ExecStdout: executing command: {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
                         let mut handle = command.spawn().expect("Failed to start task");
                         let stdout = handle.stdout.take().expect("Failed to get stdout");
-                        let mut proxy = if config.dry_run {
-                            warn!("{}: {}: dry run mode, not writing to file", service_name, archive_name);
+                        let mut proxy = if config.dry_run() {
+                            warn!("{}: {}: dry run mode, not writing to file {}", service_name, archive_name, output_file.display());
                             SpinnerWriter {
                                 output: BufWriter::new(Box::new(std::io::sink())),
                                 input: BufReader::new(stdout),
@@ -94,6 +120,7 @@ fn main() {
                                 bar: indicatif::ProgressBar::new_spinner(),
                             }
                         } else {
+                            let output = File::create(&output_file).unwrap();
                             SpinnerWriter {
                                 output: BufWriter::new(Box::new(output)),
                                 input: BufReader::new(stdout),
@@ -124,11 +151,12 @@ fn main() {
                         info!("{}: {}: using mode: ComposeNamedVolume", service_name, archive_name);
                         let global_volume_name = format!("{compose_project}_{name}");
                         debug!("{}: {}: ComposeNamedVolume: using canonical volume name: {}", service_name, archive_name, global_volume_name);
-                        let output = PathBuf::from(config.restic_base_path()).join(&service_name).join(&archive_name);
+                        let output = PathBuf::from(config.restic_root()).join(&service_name).join(&archive_name);
                         // ensure global volume exists
-                        let mut command = std::process::Command::new("docker");
+                        let mut command = config
+                            .docker_command_with_context(DockerSubcommand::volume(DockerVolumeSubcommand::inspect(&global_volume_name)))
+                            .into_command();
                         command
-                            .args(["volume", "inspect", &global_volume_name])
                             .stderr(Stdio::null())
                             .stdout(Stdio::null());
                         debug!("{}: {}: ComposeNamedVolume: inspecting volume: docker {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
@@ -136,16 +164,23 @@ fn main() {
                         if !status.success() {
                             error!("{}: {}: ComposeNamedVolume: volume {} does not exist", service_name, archive_name, global_volume_name);
                         } else {
-                            mountlist.push(format!("{}:{}", global_volume_name, output.display()))
+                            mounts.push(DockerBinding::new_ro(global_volume_name, output));
+                            if let Some(filter) = filter {
+                                excludes.push(filter.join(&archive_name));
+                            }
                         }
                     }
                     DockerInputType::ComposeBoundVolume { service, path, filter } => {
                         info!("{}: {}: using mode: ComposeBoundVolume", service_name, archive_name);
-                        let output = PathBuf::from(config.restic_base_path()).join(&service_name).join(&archive_name);
+                        let output = PathBuf::from(config.restic_root()).join(&service_name).join(&archive_name);
                         // find the bound volume inside the service
-                        let mut command = std::process::Command::new("docker");
+                        let mut command = config.docker_command_with_context(DockerSubcommand::compose(
+                            Left(compose_project.clone()),
+                            DockerComposeSubcommand::Ps(vec![service]),
+                            Vec::<String>::new(),
+                            vec!["-a", "--format", "{{.ID}}", "--no-trunc"],
+                        )).into_command();
                         command
-                            .args(["compose", "-p", &compose_project, "ps", "-a", &service, "--format", "{{.ID}}", "--no-trunc"])
                             .stderr(Stdio::null())
                             .stdout(Stdio::piped());
                         debug!("{}: {}: ComposeBoundVolume: getting container ID: docker {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
@@ -172,10 +207,11 @@ fn main() {
                                             destination: String,
                                         }
 
-                                        let mut command = std::process::Command::new("docker");
+                                        let mut command = config.docker_command_with_context(DockerSubcommand::container(
+                                            DockerContainerSubcommand::Inspect { container: container_id },
+                                            vec!["--format", "json"],
+                                        )).into_command();
                                         command
-                                            .args(["container", "inspect", "--format", "json"])
-                                            .arg(&container_id)
                                             .stdout(Stdio::piped());
                                         debug!("{}: {}: ComposeBoundVolume: inspecting container: docker {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
                                         let inspect_raw = command.output().expect("Failed to inspect container");
@@ -183,7 +219,10 @@ fn main() {
                                         match inspect.mounts.into_iter().find(|m| m.destination == path.to_string_lossy()) {
                                             Some(mount) => {
                                                 let host_path = mount.source;
-                                                mountlist.push(format!("{}:{}", host_path, output.display()));
+                                                mounts.push(DockerBinding::new_ro(host_path, output));
+                                                if let Some(filter) = filter {
+                                                    excludes.push(filter.join(&archive_name));
+                                                }
                                             }
                                             None => error!("{}: {}: ComposeBoundVolume: specified mount path is not a bound volume", service_name, archive_name),
                                         }
@@ -199,21 +238,88 @@ fn main() {
                 }
             }
         }
+
+        backups.push(ResticBackup::with_excludes(
+            PathBuf::from(config.restic_root()).join(&service_name),
+            excludes,
+        ));
     }
 
-    debug!("mountlist: {:#?}", mountlist);
-    let mut command = std::process::Command::new("docker");
-    command
-        .args(["run", "--rm"])
-        .arg("-v")
-        .arg(format!("{}:{}", config.base_path(), config.restic_base_path()));
-    for m in mountlist {
-        command.args(["-v", &m]);
-    }
+    mounts.push(DockerBinding::new_ro(
+        config.intermediate_mount_override().unwrap_or(config.intermediate_path()),
+        PathBuf::from(config.restic_root()),
+    ));
+    debug!("mountlist: {:#?}", mounts);
+
     // command.args([RESTIC_IMAGE, "sleep", "infinity"]);
-    command.arg(config.restic_image());
-    debug!("docker {}", command.get_args().map(|arg| format!("\"{}\"", arg.to_string_lossy())).collect::<Vec<_>>().join(" "));
+    // command.arg(config.restic_image());
+    // debug!("docker {}", command.get_args().map(|arg| format!("\"{}\"", arg.to_string_lossy())).collect::<Vec<_>>().join(" "));
     // command.spawn().unwrap().wait().unwrap();
+
+    // get restic related env variables
+    let mut env = vec![
+        ("RESTIC_PASSWORD_FILE".to_owned(), "/restic_password".to_owned()),
+        ("RESTIC_HOST".to_owned(), config.restic_host()),
+    ];
+
+    for (key, value) in std::env::vars() {
+        if key == "RESTIC_PASSWORD_FILE" {
+            continue;
+        }
+        if key.starts_with("RESTIC_") || key.starts_with("AWS_") {
+            debug!("setting env var: {}=***", key);
+            env.push((key, value));
+        }
+    }
+    let mut options = vec!["--rm".to_owned(), "--name".to_owned(), "hoarder-backup".to_owned(), "-d".to_owned()];
+    // append env vars
+    for (k, v) in &env {
+        options.push("--env".to_owned());
+        options.push(format!("{}={}", k, v));
+    }
+    let mut command = config.docker_command_with_context(
+        DockerSubcommand::run(
+            config.restic_image(),
+            mounts,
+            options,
+            vec!["sleep", "infinity"],
+        )
+    ).into_command();
+
+    if !command
+        .spawn()
+        .expect("failed to start restic container")
+        .wait()
+        .expect("failed to wait for restic container")
+        .success()
+    {
+        error!("failed to start restic container");
+        return;
+    }
+
+    for backup in backups {
+        let task = backup.into_task();
+
+        let mut command = config.docker_command_with_context(DockerSubcommand::exec(
+            "hoarder-backup",
+            task,
+            vec!["-it"],
+        )).into_command();
+        if config.dry_run() {
+            warn!("running in dry run mode, not actually uploading");
+            command.arg("--dry-run");
+        }
+        info!("running restic backup task: {:?}", command.get_args().collect::<Vec<_>>());
+        let exit = command.spawn().expect("failed to start restic backup").wait().expect("failed to wait for restic container to start");
+        if !exit.success() {
+            error!("restic backup failed: {}", exit);
+        }
+    }
+
+    let mut command = config.docker_command_with_context(
+        DockerSubcommand::stop("hoarder-backup", Vec::<String>::with_capacity(0))
+    ).into_command();
+    command.spawn().expect("failed to stop restic container").wait().expect("failed to wait for restic container to stop");
 }
 
 #[test]
@@ -226,7 +332,7 @@ fn test_config_dump() {
                 ArchiveOptions {
                     input: ArchiveInput::Docker(DockerInputType::ComposeNamedVolume {
                         name: "test_volume".to_owned(),
-                        filter: Some(PathFilter::Exclude(vec!["ses".to_owned()])),
+                        filter: Some(PathExclude(vec![PathBuf::from("ses")])),
                     }),
                     name: "data".to_owned(),
                 },
@@ -236,4 +342,3 @@ fn test_config_dump() {
 
     println!("{}", serde_yaml::to_string(&test).unwrap());
 }
-
