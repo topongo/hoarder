@@ -4,7 +4,7 @@ use indicatif::HumanBytes;
 use log::{debug, error, info, warn};
 use restic::ResticBackup;
 use service::Service;
-use std::{fs::File, io::{BufReader, BufWriter, Read, Write}, path::PathBuf, process::{ExitStatus, Stdio}};
+use std::{fs::File, io::{BufReader, BufWriter, Read, Write}, path::PathBuf, process::Stdio};
 use serde::Deserialize;
 
 mod config;
@@ -13,11 +13,10 @@ mod archive;
 mod task;
 mod docker;
 mod either;
-mod mount;
 mod restic;
 
 use task::ShellTask;
-use docker::{DockerBinding, DockerCommand, DockerComposeSubcommand, DockerContainerSubcommand, DockerInputType, DockerSubcommand, DockerVolumeSubcommand, PathExclude};
+use docker::{DockerBinding, DockerCommand, DockerComposeSubcommand, DockerContainerSubcommand, DockerInputType, DockerSubcommand, DockerVolumeSubcommand};
 #[allow(unused_imports)]
 use either::Either::{Left, Right};
 
@@ -240,7 +239,6 @@ fn main() -> std::io::Result<()> {
                             }
                         }
                     }
-                    _ => todo!(),
                 }
             }
         }
@@ -256,11 +254,6 @@ fn main() -> std::io::Result<()> {
         PathBuf::from(config.restic_root()),
     ));
     debug!("mountlist: {:#?}", mounts);
-
-    // command.args([RESTIC_IMAGE, "sleep", "infinity"]);
-    // command.arg(config.restic_image());
-    // debug!("docker {}", command.get_args().map(|arg| format!("\"{}\"", arg.to_string_lossy())).collect::<Vec<_>>().join(" "));
-    // command.spawn().unwrap().wait().unwrap();
 
     // get restic related env variables
     let mut env = vec![
@@ -330,14 +323,18 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    let mut command = config.docker_command_with_context(
-        DockerSubcommand::stop("hoarder-backup", Vec::<String>::with_capacity(0))
-    ).into_command();
-    command.spawn().expect("failed to stop restic container").wait().expect("failed to wait for restic container to stop");
+    config.docker_command_with_context(DockerSubcommand::stop(
+            config.restic_container_name(), Vec::<String>::with_capacity(0)
+        ))
+        .spawn_and_expect();
+
+    Ok(())
 }
 
 #[test]
 fn test_config_dump() {
+    use docker::PathExclude;
+
     let test = vec![
         Service {
             name: "test_service".to_owned(),
