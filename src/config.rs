@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{service::Service, DockerCommand, DockerSubcommand};
+use crate::{hooks::HookConfig, service::Service, DockerCommand, DockerSubcommand, SerializableError};
 
 static RESTIC_ROOT: &str = "/restic";
 static RESTIC_IMAGE: &str = "test";
@@ -65,15 +65,15 @@ impl Config {
             .unwrap_or(RESTIC_IMAGE.to_string())
     }
 
-    pub fn restic_password_file(&self) -> String {
+    pub fn restic_password_file(&self) -> Result<String, SerializableError> {
         self._get_env("RESTIC_PASSWORD_FILE")
-            .expect("restic_password_file must be set")
+            .ok_or(SerializableError::new("restic_password_file must be set"))
     }
 
-    pub fn restic_host(&self) -> String {
+    pub fn restic_host(&self) -> Result<String, SerializableError> {
         self._get_env("RESTIC_HOST")
             .or_else(|| self.restic_host.clone())
-            .expect("restic_host must be set")
+            .ok_or(SerializableError::new("restic_host must be set"))
     }
 
     pub fn restic_container_name(&self) -> String {
@@ -82,10 +82,10 @@ impl Config {
             .unwrap_or(RESTIC_CONTAINER_NAME.to_string())
     }
 
-    pub fn intermediate_path(&self) -> String {
+    pub fn intermediate_path(&self) -> Result<String, SerializableError> {
         self._get_env("INTERMEDIATE")
             .or_else(|| self.intermediate_path.clone())
-            .expect("intermediate_path must be set")
+            .ok_or(SerializableError::new("intermediate_path must be set"))
     }
 
     pub fn intermediate_mount_override(&self) -> Option<String> {

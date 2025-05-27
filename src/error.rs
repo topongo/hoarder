@@ -7,6 +7,17 @@ pub(crate) struct SerializableError {
     message: String,
 }
 
+impl SerializableError {
+    pub fn new(message: impl ToString) -> Self {
+        SerializableError { message: message.to_string() }
+    }
+
+    #[allow(dead_code)]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl Display for SerializableError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Error {{ {} }}", self.message)

@@ -98,15 +98,17 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
     let mut mounts: Vec<DockerBinding> = vec![
         DockerBinding::new_ro(
             config.restic_root(),
-            PathBuf::from(config.intermediate_mount_override().unwrap_or(config.intermediate_path())),
+            PathBuf::from(config.intermediate_mount_override().unwrap_or(config.intermediate_path()?)),
         ),
         DockerBinding::new_ro(
-            config.restic_password_file(),
+            config.restic_password_file()?,
             PathBuf::from("/restic_password"),
         )
     ];
 
     let mut failed: Vec<String> = vec![];
+    let intermediate_path = config.intermediate_path()?;
+    let restic_host = config.restic_host()?;
 
     for service in services {
         debug!("{}: service: {:?}", service.name, service);
@@ -133,7 +135,7 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
                             },
                         );
                         let mut command = dcommand.into_command();
-                        let output_path = PathBuf::from(config.intermediate_path()).join(&service_name);
+                        let output_path = PathBuf::from(&intermediate_path).join(&service_name);
                         std::fs::create_dir_all(&output_path)?;
                         let output_name = format!("{}.{}", archive_name, ext);
                         let output_file = output_path.join(output_name);
@@ -143,8 +145,22 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
                             .stderr(std::process::Stdio::piped())
                             .stdout(Stdio::piped());
                         debug!("{}: {}: ExecStdout: executing command: {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
-                        let mut handle = command.spawn().expect("Failed to start task");
-                        let stdout = handle.stdout.take().expect("Failed to get stdout");
+                        let mut handle = match command.spawn() {
+                            Ok(h) => h,
+                            Err(e) => {
+                                error!("{}: {}: ExecStdout: failed to execute command: {}", service_name, archive_name, e);
+                                failed.push(format!("{}:{}: {}", service_name, archive_name, e));
+                                continue;
+                            }
+                        };
+                        let stdout = match handle.stdout.take() {
+                            Some(s) => s,
+                            None => {
+                                error!("{}: {}: ExecStdout: no stdout found in command output", service_name, archive_name);
+                                failed.push(format!("{}:{}: no stdout found in command output", service_name, archive_name));
+                                continue;
+                            }
+                        };
                         let mut proxy = if config.dry_run() {
                             warn!("{}: {}: dry run mode, not writing to file {}", service_name, archive_name, output_file.display());
                             SpinnerWriter {
@@ -162,14 +178,29 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
                                 bar: indicatif::ProgressBar::new_spinner(),
                             }
                         };
-                        proxy.write_all().expect("Failed to write to output file");
+                        if let Err(e) = proxy.write_all() {
+                            error!("{}: {}: ExecStdout: failed to write output to file: {}", service_name, archive_name, e);
+                            failed.push(format!("{}:{}: {}", service_name, archive_name, e));
+                            continue;
+                        }
 
-                        let status = handle.wait().expect("Failed to wait for task");
+                        let status = match handle.wait() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("{}: {}: ExecStdout: failed to wait for command: {}", service_name, archive_name, e);
+                                failed.push(format!("{}:{}: {}", service_name, archive_name, e));
+                                continue;
+                            }
+                        };
                         if !status.success() {
                             error!("{}: {}: docker exec stdout failure: {}", service_name, archive_name, status);
                             if let Some(mut stderr) = handle.stderr {
                                 let mut buf = String::new();
-                                stderr.read_to_string(&mut buf).expect("Failed to read stderr");
+                                if let Err(e) = stderr.read_to_string(&mut buf) {
+                                    error!("{}: {}: ExecStdout: failed to read stderr: {}", service_name, archive_name, e);
+                                    failed.push(format!("{}:{}: {}", service_name, archive_name, e));
+                                    continue;
+                                }
                                 if !buf.is_empty() && buf != "\n" {
                                     error!("stderr output:");
                                     for line in buf.lines() {
@@ -195,7 +226,14 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
                             .stderr(Stdio::null())
                             .stdout(Stdio::null());
                         debug!("{}: {}: ComposeNamedVolume: inspecting volume: docker {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
-                        let status = command.status().expect("Failed to check volume");
+                        let status = match command.status() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("{}: {}: ComposeNamedVolume: failed to inspect volume: {}", service_name, archive_name, e);
+                                failed.push(format!("{}:{}: {}", service_name, archive_name, e));
+                                continue;
+                            }
+                        };
                         if !status.success() {
                             error!("{}: {}: ComposeNamedVolume: volume {} does not exist", service_name, archive_name, global_volume_name);
                         } else {
@@ -249,7 +287,14 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
                                         command
                                             .stdout(Stdio::piped());
                                         debug!("{}: {}: ComposeBoundVolume: inspecting container: docker {:?}", service_name, archive_name, command.get_args().collect::<Vec<_>>());
-                                        let inspect_raw = command.output().expect("Failed to inspect container");
+                                        let inspect_raw = match command.output() {
+                                            Ok(i) => i,
+                                            Err(e) => {
+                                                error!("{}: {}: ComposeBoundVolume: failed to inspect container: {}", service_name, archive_name, e);
+                                                failed.push(format!("{}:{}: {}", service_name, archive_name, e));
+                                                continue;
+                                            }
+                                        };
                                         let inspect = match serde_json::from_slice::<Vec<DockerContainerInspectOutput>>(&inspect_raw.stdout)?.into_iter().next() {
                                             Some(i) => i,
                                             None => {
@@ -287,7 +332,7 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
     }
 
     mounts.push(DockerBinding::new_ro(
-        config.intermediate_mount_override().unwrap_or(config.intermediate_path()),
+        config.intermediate_mount_override().unwrap_or(intermediate_path),
         PathBuf::from(config.restic_root()),
     ));
     debug!("mountlist: {:#?}", mounts);
@@ -295,7 +340,7 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
     // get restic related env variables
     let mut env = vec![
         ("RESTIC_PASSWORD_FILE".to_owned(), "/restic_password".to_owned()),
-        ("RESTIC_HOST".to_owned(), config.restic_host()),
+        ("RESTIC_HOST".to_owned(), restic_host),
     ];
 
     for (key, value) in std::env::vars() {
@@ -338,7 +383,7 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
         .success()
     {
         error!("failed to start restic container");
-        return Ok(());
+        return Err(SerializableError::new("failed to start restic container"));
     }
 
     for backup in backups {
@@ -354,18 +399,21 @@ fn inner(services: Vec<Service>, config: Config) -> Result<Vec<String>, Serializ
             command.arg("--dry-run");
         }
         info!("running restic backup task: {:?}", command.get_args().collect::<Vec<_>>());
-        let exit = command.spawn().expect("failed to start restic backup").wait().expect("failed to wait for restic container to start");
+        let exit = command
+            .spawn()?
+            .wait()?;
         if !exit.success() {
             error!("restic backup failed: {}", exit);
+            return Err(SerializableError::new(format!("restic backup failed: {}", exit)));
         }
     }
 
     config.docker_command_with_context(DockerSubcommand::stop(
             config.restic_container_name(), Vec::<String>::with_capacity(0)
         ))
-        .spawn_and_expect();
+        .spawn_and_wait()?;
 
-    Ok(())
+    Ok(failed)
 }
 
 #[test]
@@ -388,5 +436,5 @@ fn test_config_dump() {
         }
     ];
 
-    println!("{}", serde_yaml::to_string(&test).unwrap());
+    // println!("{}", serde_yaml::to_string(&test).unwrap());
 }
